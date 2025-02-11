@@ -185,17 +185,13 @@ func runCLIMode(flags *flags.Flags, log *logger.LeveledLogger, d *detector.Detec
 		out = output.NewLoggerReadableOutput(log)
 	}
 
-	for _, org := range orgs {
-		ctx := api.NewOrgContext(context.Background(), org.ID)
-		log.Log("Running detection for organization %q (%d)", org.Name, org.ID)
-
-		data, err := d.Run(ctx)
-		if err != nil {
-			return fmt.Errorf("run detector: %w", err)
-		}
-		if err := out.Output(data); err != nil {
-			return fmt.Errorf("output: %w", err)
-		}
+	ctx := context.Background()
+	data, err := d.Run(ctx, orgs...)
+	if err != nil {
+		return fmt.Errorf("run detector: %w", err)
+	}
+	if err := out.Output(data); err != nil {
+		return fmt.Errorf("output: %w", err)
 	}
 
 	return nil

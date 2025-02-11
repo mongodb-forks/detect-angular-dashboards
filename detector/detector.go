@@ -55,7 +55,7 @@ func NewDetector(log *logger.LeveledLogger, grafanaClient GrafanaDetectorAPIClie
 }
 
 // Run runs the angular detector tool against the specified Grafana instance.
-func (d *Detector) Run(ctx context.Context) ([]output.Dashboard, error) {
+func (d *Detector) Run(ctx context.Context, orgs ...grafana.Org) ([]output.Dashboard, error) {
 	var (
 		finalOutput []output.Dashboard
 		// Determine if we should use GCOM or frontendsettings
@@ -143,78 +143,85 @@ func (d *Detector) Run(ctx context.Context) ([]output.Dashboard, error) {
 		d.log.Verbose().Log("Plugin %q angular %t", p, isAngular)
 	}
 
-	// Map ds name -> ds plugin id, to resolve legacy dashboards that have ds name
-	apiDs, err := d.grafanaClient.GetDatasourcePluginIDs(ctx)
-	if err != nil {
-		return []output.Dashboard{}, fmt.Errorf("get datasource plugin ids: %w", err)
-	}
-	d.datasourcePluginIDs = make(map[string]string, len(apiDs))
-	for _, ds := range apiDs {
-		d.datasourcePluginIDs[ds.Name] = ds.Type
-	}
+	// Org specific checks
+	for _, org := range orgs {
+		// orgID in context is used by request from the GrafanaClient
+		ctx = api.NewOrgContext(ctx, org.ID)
+		d.log.Verbose().Log("Running detection for organization %q (%d)", org.Name, org.ID)
 
-	dashboards, err := d.grafanaClient.GetDashboards(ctx, 1)
-	if err != nil {
-		return []output.Dashboard{}, fmt.Errorf("get dashboards: %w", err)
-	}
+		// Map ds name -> ds plugin id, to resolve legacy dashboards that have ds name
+		apiDs, err := d.grafanaClient.GetDatasourcePluginIDs(ctx)
+		if err != nil {
+			return []output.Dashboard{}, fmt.Errorf("get datasource plugin ids: %w", err)
+		}
+		d.datasourcePluginIDs = make(map[string]string, len(apiDs))
+		for _, ds := range apiDs {
+			d.datasourcePluginIDs[ds.Name] = ds.Type
+		}
 
-	orgID, ok := api.OrgFromContext(ctx)
-	if !ok {
-		return []output.Dashboard{}, fmt.Errorf("could not get org ID from context")
-	}
+		dashboards, err := d.grafanaClient.GetDashboards(ctx, 1)
+		if err != nil {
+			return []output.Dashboard{}, fmt.Errorf("get dashboards: %w", err)
+		}
 
-	// Create a semaphore to limit concurrency
-	semaphore := make(chan struct{}, d.maxConcurrency)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var downloadErrors []error
+		orgID, ok := api.OrgFromContext(ctx)
+		if !ok {
+			return []output.Dashboard{}, fmt.Errorf("could not get org ID from context")
+		}
 
-	for _, dash := range dashboards {
-		wg.Add(1)
-		go func(dash grafana.ListedDashboard) {
-			defer wg.Done()
-			semaphore <- struct{}{}        // Acquire semaphore
-			defer func() { <-semaphore }() // Release semaphore
+		// Create a semaphore to limit concurrency
+		semaphore := make(chan struct{}, d.maxConcurrency)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var downloadErrors []error
 
-			dashboardAbsURL, err := url.JoinPath(strings.TrimSuffix(d.grafanaClient.BaseURL(), "/api"), dash.URL)
-			if err != nil {
-				dashboardAbsURL = ""
-			}
-			dashboardDefinition, err := d.grafanaClient.GetDashboard(ctx, dash.UID)
-			if err != nil {
+		for _, dash := range dashboards {
+			wg.Add(1)
+			go func(dash grafana.ListedDashboard) {
+				defer wg.Done()
+				semaphore <- struct{}{}        // Acquire semaphore
+				defer func() { <-semaphore }() // Release semaphore
+
+				dashboardAbsURL, err := url.JoinPath(strings.TrimSuffix(d.grafanaClient.BaseURL(), "/api"), dash.URL)
+				if err != nil {
+					dashboardAbsURL = ""
+				}
+				dashboardDefinition, err := d.grafanaClient.GetDashboard(ctx, dash.UID)
+				if err != nil {
+					mu.Lock()
+					downloadErrors = append(downloadErrors, fmt.Errorf("get dashboard %q: %w", dash.UID, err))
+					mu.Unlock()
+					return
+				}
+				dashboardOutput := output.Dashboard{
+					Detections: []output.Detection{},
+					URL:        dashboardAbsURL,
+					Title:      dash.Title,
+					Folder:     dashboardDefinition.Meta.FolderTitle,
+					CreatedBy:  dashboardDefinition.Meta.CreatedBy,
+					UpdatedBy:  dashboardDefinition.Meta.UpdatedBy,
+					Created:    dashboardDefinition.Meta.Created,
+					Updated:    dashboardDefinition.Meta.Updated,
+					OrgID:      orgID,
+				}
+				dashboardOutput.Detections, err = d.checkPanels(dashboardDefinition, dashboardDefinition.Dashboard.Panels)
+				if err != nil {
+					mu.Lock()
+					downloadErrors = append(downloadErrors, fmt.Errorf("check panels: %w", err))
+					mu.Unlock()
+					return
+				}
 				mu.Lock()
-				downloadErrors = append(downloadErrors, fmt.Errorf("get dashboard %q: %w", dash.UID, err))
+				finalOutput = append(finalOutput, dashboardOutput)
 				mu.Unlock()
-				return
-			}
-			dashboardOutput := output.Dashboard{
-				Detections: []output.Detection{},
-				URL:        dashboardAbsURL,
-				Title:      dash.Title,
-				Folder:     dashboardDefinition.Meta.FolderTitle,
-				CreatedBy:  dashboardDefinition.Meta.CreatedBy,
-				UpdatedBy:  dashboardDefinition.Meta.UpdatedBy,
-				Created:    dashboardDefinition.Meta.Created,
-				Updated:    dashboardDefinition.Meta.Updated,
-				OrgID:      orgID,
-			}
-			dashboardOutput.Detections, err = d.checkPanels(dashboardDefinition, dashboardDefinition.Dashboard.Panels)
-			if err != nil {
-				mu.Lock()
-				downloadErrors = append(downloadErrors, fmt.Errorf("check panels: %w", err))
-				mu.Unlock()
-				return
-			}
-			mu.Lock()
-			finalOutput = append(finalOutput, dashboardOutput)
-			mu.Unlock()
-		}(dash)
-	}
+			}(dash)
+		}
 
-	wg.Wait()
+		wg.Wait()
 
-	if len(downloadErrors) > 0 {
-		return finalOutput, fmt.Errorf("errors occurred during dashboard download: %v", downloadErrors)
+		if len(downloadErrors) > 0 {
+			return finalOutput, fmt.Errorf("errors occurred during dashboard download: %v", downloadErrors)
+		}
 	}
 
 	return finalOutput, nil
